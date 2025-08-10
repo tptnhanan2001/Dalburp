@@ -30,3 +30,4 @@ DalBurp is convenient for **pentesters** and **bug hunters** who want to quickly
   Install Dalfox:  
   ```bash
   go install github.com/hahwul/dalfox/v2@latest
+![DalBurp UI]([https://raw.githubusercontent.com/<username>/<repo>/main/images/screenshot.png](https://github.com/tptnhanan2001/Dalburp/blob/main/Screenshot%202025-08-10%20154210.png))
