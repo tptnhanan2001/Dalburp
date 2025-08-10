@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
-from burp import IBurpExtender, IHttpListener, ITab
-import subprocess, threading, json
-from javax.swing import JPanel, JScrollPane, JTable, table, BoxLayout
-from tempfile import NamedTemporaryFile
+from burp import IBurpExtender, IScannerCheck, IScanIssue, ITab, IContextMenuFactory
+import subprocess, json
+from javax.swing import JPanel, JScrollPane, JTable, table, BoxLayout, JMenuItem
+from java.util import ArrayList
 
-class BurpExtender(IBurpExtender, IHttpListener, ITab):
-    scanned_urls = set()
-
+class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory):
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
         self.helpers = callbacks.getHelpers()
-        callbacks.setExtensionName("Dalfox Auto Scan")
-        callbacks.registerHttpListener(self)
+        callbacks.setExtensionName("Dalfox Active Scan")
+        callbacks.registerScannerCheck(self)
+        callbacks.registerContextMenuFactory(self)
 
         # UI table setup
         self.panel = JPanel()
@@ -22,7 +21,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.panel.add(JScrollPane(self.table))
 
         callbacks.addSuiteTab(self)
-        print("[Dalfox] Extension loaded.")
+        print("[Dalfox] Active Scan Extension with Context Menu loaded.")
 
     def getTabCaption(self):
         return "Dalfox Results"
@@ -30,51 +29,68 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     def getUiComponent(self):
         return self.panel
 
-    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        if not messageIsRequest:
-            return
+    # Context menu
+    def createMenuItems(self, invocation):
+        menu_list = ArrayList()
+        menu_item = JMenuItem("Dalfox Active Scan", actionPerformed=lambda x: self.context_scan(invocation))
+        menu_list.add(menu_item)
+        return menu_list
 
-        req_info = self.helpers.analyzeRequest(messageInfo)
-        url = str(req_info.getUrl())
-        method = req_info.getMethod()
-
-        if (method, url) not in self.scanned_urls:
-            self.scanned_urls.add((method, url))
-            threading.Thread(target=self.run_dalfox, args=(method, url, messageInfo)).start()
-
-    def run_dalfox(self, method, url, messageInfo):
+    def context_scan(self, invocation):
         try:
-            request_bytes = messageInfo.getRequest()
-            request_str = self.helpers.bytesToString(request_bytes)
+            selected_messages = invocation.getSelectedMessages()
+            if not selected_messages:
+                return
 
-            parts = request_str.split("\r\n\r\n", 1)
-            head = parts[0]
-            body = parts[1] if len(parts) > 1 else ""
+            for message in selected_messages:
+                req_info = self.helpers.analyzeRequest(message)
+                url = str(req_info.getUrl())
+                method = req_info.getMethod()
+                body = self.get_request_body(message, req_info)
+                self.run_dalfox(method, url, body)
 
-            host = ""
-            for line in head.split("\r\n"):
-                if line.lower().startswith("host:"):
-                    host = line.split(":", 1)[1].strip()
-                    break
+        except Exception as e:
+            print("[Dalfox] Context Scan Error:", e)
 
-            scheme = "https" if messageInfo.getHttpService().getProtocol() == "https" else "http"
-            full_url = "{}://{}".format(scheme, host)
+    # Active scan logic
+    def doActiveScan(self, baseRequestResponse, insertionPoint):
+        try:
+            req_info = self.helpers.analyzeRequest(baseRequestResponse)
+            url = str(req_info.getUrl())
+            method = req_info.getMethod()
+            body = self.get_request_body(baseRequestResponse, req_info)
 
-            req_line = head.split("\r\n")[0]
-            path = req_line.split(" ", 2)[1]
-            full_url = "{}{}".format(full_url, path)
+            findings = self.run_dalfox(method, url, body)
+            issues = []
+            for finding in findings:
+                issues.append(CustomScanIssue(
+                    baseRequestResponse.getHttpService(),
+                    self.helpers.analyzeRequest(baseRequestResponse).getUrl(),
+                    [baseRequestResponse],
+                    "Dalfox XSS",
+                    "Possible XSS vulnerability detected.<br>Payload: <b>{}</b>".format(finding),
+                    "High"
+                ))
+            return issues if issues else None
 
-            # Dalfox command
+        except Exception as e:
+            print("[Dalfox] ActiveScan Error:", e)
+            return None
+
+    def run_dalfox(self, method, url, body):
+        try:
             if method.upper() == "GET":
-                cmd = ["dalfox", "url", full_url, "--silence"]
-            elif method.upper() == "GET":
-                cmd = ["dalfox", "url", full_url, "-b", "http://ntxss.eovhlgrzqazlzchtkozbmw1qgwt0aako0.oast.fun" ,"--silence"]
+                cmd = [
+                    "dalfox", "url", url,
+                    "-b", "http://ntxss.eovhlgrzqazlzchtkozbmw1qgwt0aako0.oast.fun",
+                    "--silence"
+                ]
             else:
                 cmd = [
-                    "dalfox", "url", full_url,
+                    "dalfox", "url", url,
                     "--data", body,
                     "--method", method,
-                     "-b", "http://ntxss.eovhlgrzqazlzchtkozbmw1qgwt0aako0.oast.fun" ,
+                    "-b", "http://ntxss.eovhlgrzqazlzchtkozbmw1qgwt0aako0.oast.fun",
                     "--silence"
                 ]
 
@@ -82,32 +98,67 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             out, err = proc.communicate()
             output_text = out.decode("utf-8", errors="ignore").strip()
 
-            vuln_found = False
-            payload = ""
-
-            if output_text.startswith("{") or output_text.startswith("["):
-                try:
-                    results = json.loads(output_text)
-                    if "data" in results:
-                        for item in results["data"]:
-                            self.add_result(method, full_url, "VULNERABLE", item.get("payload", ""), body)
-                        return
-                except:
-                    pass
-
+            payloads = []
             for line in output_text.splitlines():
                 if "[POC]" in line or "[VULN]" in line:
-                    vuln_found = True
-                    payload = line.strip()
-                    break
+                    payloads.append(line.strip())
 
-            if vuln_found:
-                self.add_result(method, full_url, "VULNERABLE", payload, body)
-            else:
-                self.add_result(method, full_url, "No Vuln", "", body)
+            # Update UI table
+            for p in payloads:
+                self.table_model.addRow([method, url, "VULNERABLE", p, body])
+            if not payloads:
+                self.table_model.addRow([method, url, "No Vuln", "", body])
+
+            return payloads
 
         except Exception as e:
-            self.add_result(method, url, "Error", str(e), "")
+            self.table_model.addRow([method, url, "Error", str(e), body])
+            return []
 
-    def add_result(self, method, url, status, payload, data):
-        self.table_model.addRow([method, url, status, payload, data])
+    def get_request_body(self, baseRequestResponse, req_info):
+        request_bytes = baseRequestResponse.getRequest()
+        body_offset = req_info.getBodyOffset()
+        return self.helpers.bytesToString(request_bytes)[body_offset:]
+
+# Custom issue class
+class CustomScanIssue(IScanIssue):
+    def __init__(self, httpService, url, httpMessages, name, detail, severity):
+        self._httpService = httpService
+        self._url = url
+        self._httpMessages = httpMessages
+        self._name = name
+        self._detail = detail
+        self._severity = severity
+
+    def getUrl(self):
+        return self._url
+
+    def getIssueName(self):
+        return self._name
+
+    def getIssueType(self):
+        return 0x08000000
+
+    def getSeverity(self):
+        return self._severity
+
+    def getConfidence(self):
+        return "Firm"
+
+    def getIssueBackground(self):
+        return None
+
+    def getRemediationBackground(self):
+        return None
+
+    def getIssueDetail(self):
+        return self._detail
+
+    def getRemediationDetail(self):
+        return None
+
+    def getHttpMessages(self):
+        return self._httpMessages
+
+    def getHttpService(self):
+        return self._httpService
