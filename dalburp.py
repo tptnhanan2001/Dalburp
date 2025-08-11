@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 from burp import IBurpExtender, IScannerCheck, IScanIssue, ITab, IContextMenuFactory
-import subprocess, json
-from javax.swing import JPanel, JScrollPane, JTable, table, BoxLayout, JMenuItem
+import subprocess, threading
+from javax.swing import JPanel, JScrollPane, JTable, BoxLayout, JMenuItem
+from javax.swing.table import DefaultTableModel
 from java.util import ArrayList
 
 class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory):
+
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
         self.helpers = callbacks.getHelpers()
@@ -12,11 +14,11 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory):
         callbacks.registerScannerCheck(self)
         callbacks.registerContextMenuFactory(self)
 
-        # UI table setup
+        # UI table setup: Method, URL, Status, Payload, Data, Cookie/Auth
         self.panel = JPanel()
         self.panel.setLayout(BoxLayout(self.panel, BoxLayout.Y_AXIS))
-        self.columns = ["Method", "URL", "Status", "Payload", "Data"]
-        self.table_model = table.DefaultTableModel([], self.columns)
+        self.columns = ["Method", "URL", "Status", "Payload", "Data", "Cookie", "Authorization"]
+        self.table_model = DefaultTableModel([], self.columns)
         self.table = JTable(self.table_model)
         self.panel.add(JScrollPane(self.table))
 
@@ -29,7 +31,6 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory):
     def getUiComponent(self):
         return self.panel
 
-    # Context menu
     def createMenuItems(self, invocation):
         menu_list = ArrayList()
         menu_item = JMenuItem("Dalfox Active Scan", actionPerformed=lambda x: self.context_scan(invocation))
@@ -46,79 +47,60 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab, IContextMenuFactory):
                 req_info = self.helpers.analyzeRequest(message)
                 url = str(req_info.getUrl())
                 method = req_info.getMethod()
+                headers = req_info.getHeaders()
                 body = self.get_request_body(message, req_info)
-                self.run_dalfox(method, url, body)
+
+                # Extract specific headers
+                cookie_header = ""
+                auth_header = ""
+                header_list = []
+                for h in headers:
+                    if ":" in h and not h.lower().startswith("host:"):
+                        header_list.append(h)
+                        if h.lower().startswith("cookie:"):
+                            cookie_header = h.split(":", 1)[1].strip()
+                        if h.lower().startswith("authorization:"):
+                            auth_header = h.split(":", 1)[1].strip()
+
+                t = threading.Thread(target=self.run_dalfox, args=(method, url, body, header_list, cookie_header, auth_header))
+                t.start()
 
         except Exception as e:
             print("[Dalfox] Context Scan Error:", e)
 
-    # Active scan logic
-    def doActiveScan(self, baseRequestResponse, insertionPoint):
+    def run_dalfox(self, method, url, body, headers=None, cookie="", auth=""):
         try:
-            req_info = self.helpers.analyzeRequest(baseRequestResponse)
-            url = str(req_info.getUrl())
-            method = req_info.getMethod()
-            body = self.get_request_body(baseRequestResponse, req_info)
+            cmd = ["dalfox", "url", url, "--silence"]
 
-            findings = self.run_dalfox(method, url, body)
-            issues = []
-            for finding in findings:
-                issues.append(CustomScanIssue(
-                    baseRequestResponse.getHttpService(),
-                    self.helpers.analyzeRequest(baseRequestResponse).getUrl(),
-                    [baseRequestResponse],
-                    "Dalfox XSS",
-                    "Possible XSS vulnerability detected.<br>Payload: <b>{}</b>".format(finding),
-                    "High"
-                ))
-            return issues if issues else None
+            if headers:
+                for h in headers:
+                    cmd.extend(["-H", h])
 
-        except Exception as e:
-            print("[Dalfox] ActiveScan Error:", e)
-            return None
+            if method and method.upper() != "GET":
+                cmd.extend(["--data", body or "", "--method", method])
 
-    def run_dalfox(self, method, url, body):
-        try:
-            if method.upper() == "GET":
-                cmd = [
-                    "dalfox", "url", url,
-                    "-b", "http://ntxss.eovhlgrzqazlzchtkozbmw1qgwt0aako0.oast.fun",
-                    "--silence"
-                ]
-            else:
-                cmd = [
-                    "dalfox", "url", url,
-                    "--data", body,
-                    "--method", method,
-                    "-b", "http://ntxss.eovhlgrzqazlzchtkozbmw1qgwt0aako0.oast.fun",
-                    "--silence"
-                ]
-
+            print("[Dalfox] Running: " + " ".join(cmd))
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = proc.communicate()
             output_text = out.decode("utf-8", errors="ignore").strip()
 
-            payloads = []
-            for line in output_text.splitlines():
-                if "[POC]" in line or "[VULN]" in line:
-                    payloads.append(line.strip())
+            payloads = [line.strip() for line in output_text.splitlines() if "[POC]" in line or "[VULN]" in line]
+            status = "VULNERABLE" if payloads else "No Vuln"
 
-            # Update UI table
-            for p in payloads:
-                self.table_model.addRow([method, url, "VULNERABLE", p, body])
-            if not payloads:
-                self.table_model.addRow([method, url, "No Vuln", "", body])
-
-            return payloads
+            if payloads:
+                for p in payloads:
+                    self.table_model.addRow([method, url, status, p, body, cookie, auth])
+            else:
+                self.table_model.addRow([method, url, status, "", body, cookie, auth])
 
         except Exception as e:
-            self.table_model.addRow([method, url, "Error", str(e), body])
-            return []
+            self.table_model.addRow([method, url, "Error", str(e), body, cookie, auth])
 
     def get_request_body(self, baseRequestResponse, req_info):
         request_bytes = baseRequestResponse.getRequest()
         body_offset = req_info.getBodyOffset()
         return self.helpers.bytesToString(request_bytes)[body_offset:]
+
 
 # Custom issue class
 class CustomScanIssue(IScanIssue):
